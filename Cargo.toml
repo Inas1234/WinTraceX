@@ -1,0 +1,29 @@
+[package]
+name = "win_api_trace_ui"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "win_api_trace_agent"
+path = "src/agent_dll.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+eframe = "0.30"
+retour = "0.4.0-alpha.4"
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+] }
