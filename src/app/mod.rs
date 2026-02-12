@@ -1,10 +1,11 @@
 use crate::hook::injector::inject_agent_dll;
 use crate::hook::udp_listener::start_udp_event_listener;
-use crate::hook::{trigger_smoke_test_call, HookManager};
+use crate::hook::{HookManager, trigger_smoke_test_call};
+use crate::model::dll::LoadedDlls;
 use crate::model::event::Event;
 use crate::model::filters::{EventFilters, EventSortColumn};
-use crate::model::process::{enumerate_processes, ProcessEntry};
-use crate::util::process_launch::launch_target_exe;
+use crate::model::process::{ProcessEntry, enumerate_processes};
+use crate::util::process_launch::launch_target_exe_suspended;
 use eframe::egui;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -12,8 +13,15 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 
 pub mod widgets {
     pub mod details_panel;
+    pub mod dll_table;
     pub mod event_table;
     pub mod left_panel;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainTab {
+    Events,
+    Dlls,
 }
 
 pub struct WinApiTraceApp {
@@ -23,6 +31,9 @@ pub struct WinApiTraceApp {
     events: Vec<Event>,
     filters: EventFilters,
     selected_event: Option<usize>,
+    main_tab: MainTab,
+    dlls: LoadedDlls,
+    dll_query: String,
     hook_manager: HookManager,
     event_tx: Sender<Event>,
     event_rx: Receiver<Event>,
@@ -41,6 +52,9 @@ impl Default for WinApiTraceApp {
             events: Vec::new(),
             filters: EventFilters::default(),
             selected_event: None,
+            main_tab: MainTab::Events,
+            dlls: LoadedDlls::default(),
+            dll_query: String::new(),
             hook_manager: HookManager::default(),
             event_tx,
             event_rx,
@@ -58,6 +72,34 @@ impl Default for WinApiTraceApp {
 }
 
 impl WinApiTraceApp {
+    fn should_retry_attach_after_resume(error: &str) -> bool {
+        error.contains("GetLastError=299")
+            || error.contains("last error=299")
+            || error.contains("ERROR_PARTIAL_COPY")
+            || error.contains("ERROR_BAD_LENGTH")
+    }
+
+    fn retry_attach_after_resume(
+        &self,
+        pid: u32,
+        attempts: usize,
+    ) -> Result<(usize, String), String> {
+        let mut last_error = String::new();
+        for attempt in 1..=attempts {
+            if attempt > 1 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            match inject_agent_dll(pid) {
+                Ok(dll_path) => return Ok((attempt, dll_path)),
+                Err(error) => {
+                    last_error = error;
+                }
+            }
+        }
+
+        Err(last_error)
+    }
+
     fn refresh_process_list(&mut self) {
         match enumerate_processes() {
             Ok(processes) => {
@@ -80,7 +122,8 @@ impl WinApiTraceApp {
         if pid == current_pid {
             match self.hook_manager.install(self.event_tx.clone()) {
                 Ok(()) => {
-                    self.attach_status = format!("Attached. Local hooks active in PID {current_pid}.");
+                    self.attach_status =
+                        format!("Attached. Local hooks active in PID {current_pid}.");
                     trigger_smoke_test_call();
                 }
                 Err(error) => {
@@ -102,12 +145,57 @@ impl WinApiTraceApp {
     }
 
     fn handle_launch_and_attach_request(&mut self) {
-        match launch_target_exe(&self.launch_exe_path) {
-            Ok(pid) => {
+        match launch_target_exe_suspended(&self.launch_exe_path) {
+            Ok(process) => {
+                let pid = process.pid;
                 self.pid_input = pid.to_string();
-                self.attach_status = format!("Started process PID {pid}, attempting attach...");
+                self.attach_status = format!(
+                    "Started suspended process PID {pid}, injecting agent before first frame..."
+                );
+
+                let attach_result = inject_agent_dll(pid);
+                match &attach_result {
+                    Ok(dll_path) => {
+                        self.attach_status =
+                            format!("Injected agent into suspended PID {pid} using {dll_path}");
+                    }
+                    Err(error) => {
+                        self.attach_status = format!(
+                            "Attach failed for suspended PID {pid}: {error}. Resuming process anyway."
+                        );
+                    }
+                }
+
+                if let Err(error) = process.resume() {
+                    self.attach_status = format!("Launch failed to resume PID {pid}: {error}");
+                    return;
+                }
+
+                if let Err(error) = attach_result {
+                    if Self::should_retry_attach_after_resume(&error) {
+                        match self.retry_attach_after_resume(pid, 16) {
+                            Ok((attempt, dll_path)) => {
+                                self.attach_status = format!(
+                                    "Initial suspended attach failed, but retry succeeded after resume (attempt {attempt}) using {dll_path}"
+                                );
+                            }
+                            Err(retry_error) => {
+                                self.attach_status = format!(
+                                    "Process PID {pid} resumed, initial attach failed ({error}), and retry also failed: {retry_error}"
+                                );
+                            }
+                        }
+                    } else {
+                        self.attach_status =
+                            format!("Process PID {pid} resumed, but attach failed: {error}");
+                    }
+                } else {
+                    self.attach_status = format!(
+                        "Attached to PID {pid} before resume. Early graphics init calls should now be visible."
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(120));
                 self.refresh_process_list();
-                self.handle_attach_request(pid);
             }
             Err(error) => {
                 self.attach_status = format!("Launch failed: {error}");
@@ -117,6 +205,7 @@ impl WinApiTraceApp {
 
     fn drain_live_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
+            self.dlls.observe_event(&event);
             self.events.push(event);
         }
     }
@@ -126,7 +215,10 @@ impl WinApiTraceApp {
             .events
             .iter()
             .enumerate()
-            .filter_map(|(index, event)| self.filters.matches(event).then_some(index))
+            // DLL load events have their own dedicated tab; keep the Events view focused.
+            .filter_map(|(index, event)| {
+                (event.api != "DllLoad" && self.filters.matches(event)).then_some(index)
+            })
             .collect();
 
         visible_indices.sort_by(|left, right| {
@@ -169,8 +261,12 @@ impl eframe::App for WinApiTraceApp {
             &mut self.selected_process,
         ) {
             match action {
-                widgets::left_panel::LeftPanelAction::Attach(pid) => self.handle_attach_request(pid),
-                widgets::left_panel::LeftPanelAction::RefreshProcesses => self.refresh_process_list(),
+                widgets::left_panel::LeftPanelAction::Attach(pid) => {
+                    self.handle_attach_request(pid)
+                }
+                widgets::left_panel::LeftPanelAction::RefreshProcesses => {
+                    self.refresh_process_list()
+                }
                 widgets::left_panel::LeftPanelAction::LaunchAndAttach => {
                     self.handle_launch_and_attach_request()
                 }
@@ -178,15 +274,40 @@ impl eframe::App for WinApiTraceApp {
         }
 
         self.drain_live_events();
-        widgets::details_panel::show(ctx, self.selected_event.and_then(|idx| self.events.get(idx)));
-
-        let visible_indices = self.visible_event_indices();
-        widgets::event_table::show(
+        widgets::details_panel::show(
             ctx,
-            &self.events,
-            &visible_indices,
-            &mut self.selected_event,
-            &mut self.filters,
+            self.selected_event.and_then(|idx| self.events.get(idx)),
         );
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.main_tab, MainTab::Events, "Events");
+                ui.selectable_value(&mut self.main_tab, MainTab::Dlls, "DLLs");
+            });
+            ui.separator();
+
+            match self.main_tab {
+                MainTab::Events => {
+                    let visible_indices = self.visible_event_indices();
+                    if let Some(selected) = self.selected_event {
+                        // If the currently selected event is hidden in the Events view, clear it
+                        // so the details panel doesn't keep showing stale/irrelevant data.
+                        if !visible_indices.contains(&selected) {
+                            self.selected_event = None;
+                        }
+                    }
+                    widgets::event_table::show(
+                        ui,
+                        &self.events,
+                        &visible_indices,
+                        &mut self.selected_event,
+                        &mut self.filters,
+                    );
+                }
+                MainTab::Dlls => {
+                    widgets::dll_table::show(ui, &self.dlls, &mut self.dll_query);
+                }
+            }
+        });
     }
 }

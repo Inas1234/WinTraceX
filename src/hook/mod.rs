@@ -32,6 +32,12 @@ type FnMoveWindow = unsafe extern "system" fn(isize, i32, i32, i32, i32, i32) ->
 type FnChangeDisplaySettingsExW =
     unsafe extern "system" fn(*const u16, *const DEVMODEW, isize, u32, *const c_void) -> i32;
 type FnAdjustWindowRectEx = unsafe extern "system" fn(*mut RECT, u32, i32, u32) -> i32;
+type FnDirectDrawCreate =
+    unsafe extern "system" fn(*const c_void, *mut *mut c_void, *mut c_void) -> i32;
+type FnDirectDrawCreateEx =
+    unsafe extern "system" fn(*const c_void, *mut *mut c_void, *const c_void, *mut c_void) -> i32;
+type FnDirect3DCreate9 = unsafe extern "system" fn(u32) -> *mut c_void;
+type FnDirect3DCreate9Ex = unsafe extern "system" fn(u32, *mut *mut c_void) -> i32;
 
 static EVENT_SENDER: OnceLock<Mutex<Option<Sender<Event>>>> = OnceLock::new();
 static START_TIME: OnceLock<Instant> = OnceLock::new();
@@ -42,6 +48,10 @@ static MOVE_WINDOW_HOOK: OnceLock<GenericDetour<FnMoveWindow>> = OnceLock::new()
 static CHANGE_DISPLAY_SETTINGS_EXW_HOOK: OnceLock<GenericDetour<FnChangeDisplaySettingsExW>> =
     OnceLock::new();
 static ADJUST_WINDOW_RECT_EX_HOOK: OnceLock<GenericDetour<FnAdjustWindowRectEx>> = OnceLock::new();
+static DIRECTDRAW_CREATE_HOOK: OnceLock<GenericDetour<FnDirectDrawCreate>> = OnceLock::new();
+static DIRECTDRAW_CREATE_EX_HOOK: OnceLock<GenericDetour<FnDirectDrawCreateEx>> = OnceLock::new();
+static DIRECT3D_CREATE9_HOOK: OnceLock<GenericDetour<FnDirect3DCreate9>> = OnceLock::new();
+static DIRECT3D_CREATE9_EX_HOOK: OnceLock<GenericDetour<FnDirect3DCreate9Ex>> = OnceLock::new();
 
 #[derive(Default)]
 pub struct HookManager {
@@ -62,26 +72,72 @@ impl HookManager {
             *guard = Some(sender);
         }
 
-        let create_target: FnCreateWindowExW = unsafe { resolve_user32_proc(b"CreateWindowExW\0")? };
-        let set_window_pos_target: FnSetWindowPos = unsafe { resolve_user32_proc(b"SetWindowPos\0")? };
-        let move_window_target: FnMoveWindow = unsafe { resolve_user32_proc(b"MoveWindow\0")? };
+        let create_target: FnCreateWindowExW =
+            unsafe { resolve_proc_in_module(b"user32.dll\0", b"CreateWindowExW\0")? };
+        let set_window_pos_target: FnSetWindowPos =
+            unsafe { resolve_proc_in_module(b"user32.dll\0", b"SetWindowPos\0")? };
+        let move_window_target: FnMoveWindow =
+            unsafe { resolve_proc_in_module(b"user32.dll\0", b"MoveWindow\0")? };
         let change_display_target: FnChangeDisplaySettingsExW =
-            unsafe { resolve_user32_proc(b"ChangeDisplaySettingsExW\0")? };
+            unsafe { resolve_proc_in_module(b"user32.dll\0", b"ChangeDisplaySettingsExW\0")? };
         let adjust_rect_target: FnAdjustWindowRectEx =
-            unsafe { resolve_user32_proc(b"AdjustWindowRectEx\0")? };
+            unsafe { resolve_proc_in_module(b"user32.dll\0", b"AdjustWindowRectEx\0")? };
+        let directdraw_create_target: Option<FnDirectDrawCreate> =
+            unsafe { try_resolve_proc_in_module(b"ddraw.dll\0", b"DirectDrawCreate\0")? };
+        let directdraw_create_ex_target: Option<FnDirectDrawCreateEx> =
+            unsafe { try_resolve_proc_in_module(b"ddraw.dll\0", b"DirectDrawCreateEx\0")? };
+        let direct3d_create9_target: Option<FnDirect3DCreate9> =
+            unsafe { try_resolve_proc_in_module(b"d3d9.dll\0", b"Direct3DCreate9\0")? };
+        let direct3d_create9_ex_target: Option<FnDirect3DCreate9Ex> =
+            unsafe { try_resolve_proc_in_module(b"d3d9.dll\0", b"Direct3DCreate9Ex\0")? };
 
         let create_hook = unsafe { GenericDetour::new(create_target, create_window_exw_detour) }
             .map_err(|e| format!("CreateWindowExW init failed: {e}"))?;
-        let set_window_pos_hook = unsafe { GenericDetour::new(set_window_pos_target, set_window_pos_detour) }
-            .map_err(|e| format!("SetWindowPos init failed: {e}"))?;
-        let move_window_hook = unsafe { GenericDetour::new(move_window_target, move_window_detour) }
-            .map_err(|e| format!("MoveWindow init failed: {e}"))?;
+        let set_window_pos_hook =
+            unsafe { GenericDetour::new(set_window_pos_target, set_window_pos_detour) }
+                .map_err(|e| format!("SetWindowPos init failed: {e}"))?;
+        let move_window_hook =
+            unsafe { GenericDetour::new(move_window_target, move_window_detour) }
+                .map_err(|e| format!("MoveWindow init failed: {e}"))?;
         let change_display_hook = unsafe {
             GenericDetour::new(change_display_target, change_display_settings_exw_detour)
         }
         .map_err(|e| format!("ChangeDisplaySettingsExW init failed: {e}"))?;
-        let adjust_rect_hook = unsafe { GenericDetour::new(adjust_rect_target, adjust_window_rect_ex_detour) }
-            .map_err(|e| format!("AdjustWindowRectEx init failed: {e}"))?;
+        let adjust_rect_hook =
+            unsafe { GenericDetour::new(adjust_rect_target, adjust_window_rect_ex_detour) }
+                .map_err(|e| format!("AdjustWindowRectEx init failed: {e}"))?;
+        let directdraw_create_hook = if let Some(target) = directdraw_create_target {
+            Some(
+                unsafe { GenericDetour::new(target, directdraw_create_detour) }
+                    .map_err(|e| format!("DirectDrawCreate init failed: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let directdraw_create_ex_hook = if let Some(target) = directdraw_create_ex_target {
+            Some(
+                unsafe { GenericDetour::new(target, directdraw_create_ex_detour) }
+                    .map_err(|e| format!("DirectDrawCreateEx init failed: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let direct3d_create9_hook = if let Some(target) = direct3d_create9_target {
+            Some(
+                unsafe { GenericDetour::new(target, direct3d_create9_detour) }
+                    .map_err(|e| format!("Direct3DCreate9 init failed: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let direct3d_create9_ex_hook = if let Some(target) = direct3d_create9_ex_target {
+            Some(
+                unsafe { GenericDetour::new(target, direct3d_create9_ex_detour) }
+                    .map_err(|e| format!("Direct3DCreate9Ex init failed: {e}"))?,
+            )
+        } else {
+            None
+        };
 
         CREATE_WINDOW_EXW_HOOK
             .set(create_hook)
@@ -98,6 +154,26 @@ impl HookManager {
         ADJUST_WINDOW_RECT_EX_HOOK
             .set(adjust_rect_hook)
             .map_err(|_| "AdjustWindowRectEx hook was already set".to_owned())?;
+        if let Some(hook) = directdraw_create_hook {
+            DIRECTDRAW_CREATE_HOOK
+                .set(hook)
+                .map_err(|_| "DirectDrawCreate hook was already set".to_owned())?;
+        }
+        if let Some(hook) = directdraw_create_ex_hook {
+            DIRECTDRAW_CREATE_EX_HOOK
+                .set(hook)
+                .map_err(|_| "DirectDrawCreateEx hook was already set".to_owned())?;
+        }
+        if let Some(hook) = direct3d_create9_hook {
+            DIRECT3D_CREATE9_HOOK
+                .set(hook)
+                .map_err(|_| "Direct3DCreate9 hook was already set".to_owned())?;
+        }
+        if let Some(hook) = direct3d_create9_ex_hook {
+            DIRECT3D_CREATE9_EX_HOOK
+                .set(hook)
+                .map_err(|_| "Direct3DCreate9Ex hook was already set".to_owned())?;
+        }
 
         unsafe {
             CREATE_WINDOW_EXW_HOOK
@@ -134,6 +210,20 @@ impl HookManager {
                 .enable()
         }
         .map_err(|e| format!("AdjustWindowRectEx enable failed: {e}"))?;
+        if let Some(hook) = DIRECTDRAW_CREATE_HOOK.get() {
+            unsafe { hook.enable() }.map_err(|e| format!("DirectDrawCreate enable failed: {e}"))?;
+        }
+        if let Some(hook) = DIRECTDRAW_CREATE_EX_HOOK.get() {
+            unsafe { hook.enable() }
+                .map_err(|e| format!("DirectDrawCreateEx enable failed: {e}"))?;
+        }
+        if let Some(hook) = DIRECT3D_CREATE9_HOOK.get() {
+            unsafe { hook.enable() }.map_err(|e| format!("Direct3DCreate9 enable failed: {e}"))?;
+        }
+        if let Some(hook) = DIRECT3D_CREATE9_EX_HOOK.get() {
+            unsafe { hook.enable() }
+                .map_err(|e| format!("Direct3DCreate9Ex enable failed: {e}"))?;
+        }
 
         self.installed = true;
         Ok(())
@@ -284,6 +374,84 @@ unsafe extern "system" fn adjust_window_rect_ex_detour(
     result
 }
 
+unsafe extern "system" fn directdraw_create_detour(
+    guid: *const c_void,
+    direct_draw_out: *mut *mut c_void,
+    unknown_outer: *mut c_void,
+) -> i32 {
+    let result = unsafe {
+        DIRECTDRAW_CREATE_HOOK
+            .get()
+            .expect("DirectDrawCreate hook not installed")
+            .call(guid, direct_draw_out, unknown_outer)
+    };
+
+    dispatch_event(make_event(
+        "DirectDrawCreate",
+        format!("guid_ptr={guid:p} out_ptr={direct_draw_out:p} outer_ptr={unknown_outer:p}"),
+        hresult_result(result),
+    ));
+    result
+}
+
+unsafe extern "system" fn directdraw_create_ex_detour(
+    guid: *const c_void,
+    direct_draw_out: *mut *mut c_void,
+    iid: *const c_void,
+    unknown_outer: *mut c_void,
+) -> i32 {
+    let result = unsafe {
+        DIRECTDRAW_CREATE_EX_HOOK
+            .get()
+            .expect("DirectDrawCreateEx hook not installed")
+            .call(guid, direct_draw_out, iid, unknown_outer)
+    };
+
+    dispatch_event(make_event(
+        "DirectDrawCreateEx",
+        format!(
+            "guid_ptr={guid:p} out_ptr={direct_draw_out:p} iid_ptr={iid:p} outer_ptr={unknown_outer:p}"
+        ),
+        hresult_result(result),
+    ));
+    result
+}
+
+unsafe extern "system" fn direct3d_create9_detour(sdk_version: u32) -> *mut c_void {
+    let result_ptr = unsafe {
+        DIRECT3D_CREATE9_HOOK
+            .get()
+            .expect("Direct3DCreate9 hook not installed")
+            .call(sdk_version)
+    };
+
+    dispatch_event(make_event(
+        "Direct3DCreate9",
+        format!("sdk_version={sdk_version}"),
+        format!("PTR={result_ptr:p}"),
+    ));
+    result_ptr
+}
+
+unsafe extern "system" fn direct3d_create9_ex_detour(
+    sdk_version: u32,
+    direct3d_out: *mut *mut c_void,
+) -> i32 {
+    let result = unsafe {
+        DIRECT3D_CREATE9_EX_HOOK
+            .get()
+            .expect("Direct3DCreate9Ex hook not installed")
+            .call(sdk_version, direct3d_out)
+    };
+
+    dispatch_event(make_event(
+        "Direct3DCreate9Ex",
+        format!("sdk_version={sdk_version} out_ptr={direct3d_out:p}"),
+        hresult_result(result),
+    ));
+    result
+}
+
 fn dispatch_event(event: Event) {
     if let Some(slot) = EVENT_SENDER.get() {
         if let Ok(guard) = slot.lock() {
@@ -316,22 +484,46 @@ fn bool_result(value: i32) -> String {
     }
 }
 
+fn hresult_result(value: i32) -> String {
+    format!("HRESULT=0x{:08X}", value as u32)
+}
+
 fn elapsed_ms() -> u64 {
     let started_at = START_TIME.get_or_init(Instant::now);
     let millis = started_at.elapsed().as_millis();
     millis.min(u64::MAX as u128) as u64
 }
 
-unsafe fn resolve_user32_proc<T>(name: &'static [u8]) -> Result<T, String> {
-    let module = unsafe { LoadLibraryA(b"user32.dll\0".as_ptr()) };
+unsafe fn resolve_proc_in_module<T>(
+    module_name: &'static [u8],
+    proc_name: &'static [u8],
+) -> Result<T, String> {
+    let module = unsafe { LoadLibraryA(module_name.as_ptr()) };
     if module.is_null() {
-        return Err("LoadLibraryA(user32.dll) failed".to_owned());
+        return Err(format!(
+            "LoadLibraryA({}) failed",
+            display_proc(module_name)
+        ));
     }
 
-    let proc = unsafe { GetProcAddress(module, name.as_ptr()) };
-    let proc = proc.ok_or_else(|| format!("GetProcAddress failed for {}", display_proc(name)))?;
+    let proc = unsafe { GetProcAddress(module, proc_name.as_ptr()) };
+    let proc =
+        proc.ok_or_else(|| format!("GetProcAddress failed for {}", display_proc(proc_name)))?;
 
     Ok(proc_to_fn(proc))
+}
+
+unsafe fn try_resolve_proc_in_module<T>(
+    module_name: &'static [u8],
+    proc_name: &'static [u8],
+) -> Result<Option<T>, String> {
+    let module = unsafe { LoadLibraryA(module_name.as_ptr()) };
+    if module.is_null() {
+        return Ok(None);
+    }
+
+    let proc = unsafe { GetProcAddress(module, proc_name.as_ptr()) };
+    Ok(proc.map(proc_to_fn))
 }
 
 fn proc_to_fn<T>(proc: unsafe extern "system" fn() -> isize) -> T {
@@ -340,6 +532,9 @@ fn proc_to_fn<T>(proc: unsafe extern "system" fn() -> isize) -> T {
 }
 
 fn display_proc(name: &[u8]) -> String {
-    let end = name.iter().position(|byte| *byte == 0).unwrap_or(name.len());
+    let end = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
     String::from_utf8_lossy(&name[..end]).to_string()
 }

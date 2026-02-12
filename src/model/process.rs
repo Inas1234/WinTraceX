@@ -1,6 +1,6 @@
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 
 #[derive(Debug, Clone)]
@@ -27,7 +27,8 @@ pub fn enumerate_processes() -> Result<Vec<ProcessEntry>, String> {
                 name: utf16_to_string(&entry.szExeFile),
             });
 
-            let next_ok = unsafe { Process32NextW(snapshot, &mut entry as *mut PROCESSENTRY32W) } != 0;
+            let next_ok =
+                unsafe { Process32NextW(snapshot, &mut entry as *mut PROCESSENTRY32W) } != 0;
             if !next_ok {
                 break;
             }

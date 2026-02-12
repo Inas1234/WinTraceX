@@ -1,12 +1,14 @@
 mod app;
 mod hook;
 mod model {
+    pub mod dll;
     pub mod event;
     pub mod filters;
     pub mod ipc;
     pub mod process;
 }
 mod util {
+    pub mod ascii;
     pub mod process_launch;
     pub mod time_format;
 }

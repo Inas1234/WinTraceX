@@ -1,5 +1,5 @@
-use eframe::egui;
 use crate::model::process::ProcessEntry;
+use eframe::egui;
 use rfd::FileDialog;
 
 pub enum LeftPanelAction {
@@ -28,10 +28,7 @@ pub fn show(
 
             let pid_validation = validate_pid(pid_input);
             let attach_clicked = ui
-                .add_enabled(
-                    pid_validation.is_ok(),
-                    egui::Button::new("Attach"),
-                )
+                .add_enabled(pid_validation.is_ok(), egui::Button::new("Attach"))
                 .clicked();
 
             if attach_clicked {

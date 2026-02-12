@@ -4,27 +4,31 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, ERROR_BAD_LENGTH,
-    ERROR_PARTIAL_COPY,
+    CloseHandle, ERROR_BAD_LENGTH, ERROR_NO_MORE_FILES, ERROR_PARTIAL_COPY, GetLastError, HANDLE,
+    HMODULE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+    CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE,
     TH32CS_SNAPMODULE32,
 };
 use windows_sys::Win32::System::Memory::{
-    VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAllocEx, VirtualFreeEx,
+};
+use windows_sys::Win32::System::ProcessStatus::{
+    K32EnumProcessModulesEx, K32GetModuleBaseNameW, K32GetModuleFileNameExW, LIST_MODULES_32BIT,
+    LIST_MODULES_ALL,
 };
 use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64,
     IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateRemoteThread, GetExitCodeThread, IsWow64Process, IsWow64Process2, OpenProcess,
-    WaitForSingleObject, INFINITE, LPTHREAD_START_ROUTINE, PROCESS_CREATE_THREAD,
-    PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+    CreateRemoteThread, GetExitCodeThread, INFINITE, IsWow64Process, IsWow64Process2,
+    LPTHREAD_START_ROUTINE, OpenProcess, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION,
+    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, WaitForSingleObject,
 };
 
 pub fn inject_agent_dll(pid: u32) -> Result<String, String> {
@@ -51,7 +55,8 @@ pub fn inject_agent_dll(pid: u32) -> Result<String, String> {
         if target_machine == IMAGE_FILE_MACHINE_I386 {
             ensure_x86_runtime_dependencies(&dll_path)?;
         }
-        let load_library_w_remote = resolve_remote_loadlibraryw(pid, target_machine)?;
+        let load_library_w_remote =
+            resolve_remote_loadlibraryw(process_handle.0, pid, target_machine)?;
 
         let dll_wide: Vec<u16> = dll_path
             .as_os_str()
@@ -114,11 +119,14 @@ pub fn inject_agent_dll(pid: u32) -> Result<String, String> {
         let wait_result = WaitForSingleObject(thread_handle.0, INFINITE);
         if wait_result != WAIT_OBJECT_0 {
             let _ = VirtualFreeEx(process_handle.0, remote_buffer, 0, MEM_RELEASE);
-            return Err(format!("WaitForSingleObject failed with code {wait_result}"));
+            return Err(format!(
+                "WaitForSingleObject failed with code {wait_result}"
+            ));
         }
 
         let mut remote_module_handle = 0u32;
-        let exit_ok = GetExitCodeThread(thread_handle.0, &mut remote_module_handle as *mut u32) != 0;
+        let exit_ok =
+            GetExitCodeThread(thread_handle.0, &mut remote_module_handle as *mut u32) != 0;
         let _ = VirtualFreeEx(process_handle.0, remote_buffer, 0, MEM_RELEASE);
 
         if !exit_ok {
@@ -132,7 +140,28 @@ pub fn inject_agent_dll(pid: u32) -> Result<String, String> {
             ));
         }
 
-        Ok(dll_path.display().to_string())
+        let remote_module_base = if target_machine == IMAGE_FILE_MACHINE_I386 {
+            remote_module_handle as usize
+        } else {
+            let module_name = dll_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("Invalid DLL file name: {}", dll_path.display()))?;
+            find_remote_module(process_handle.0, pid, module_name, target_machine)?.base_addr
+        };
+
+        run_remote_export(
+            process_handle.0,
+            remote_module_base,
+            &dll_path,
+            "InitializeAgent",
+        )?;
+
+        Ok(format!(
+            "{} ({})",
+            dll_path.display(),
+            describe_file_brief(&dll_path)
+        ))
     }
 }
 
@@ -148,24 +177,21 @@ fn resolve_agent_dll_path(target_machine: IMAGE_FILE_MACHINE) -> Result<PathBuf,
     match target_machine {
         IMAGE_FILE_MACHINE_I386 => {
             let preferred = exe_dir.join("win_api_trace_agent_x86.dll");
-            if preferred.exists() {
-                return Ok(preferred);
-            }
-
             let gnullvm_candidate = target_dir
                 .join("i686-pc-windows-gnullvm")
                 .join("debug")
                 .join("win_api_trace_agent.dll");
-            if gnullvm_candidate.exists() {
-                return Ok(gnullvm_candidate);
-            }
-
             let gnu_candidate = target_dir
                 .join("i686-pc-windows-gnu")
                 .join("debug")
                 .join("win_api_trace_agent.dll");
-            if gnu_candidate.exists() {
-                return Ok(gnu_candidate);
+            let candidates = [
+                preferred.clone(),
+                gnullvm_candidate.clone(),
+                gnu_candidate.clone(),
+            ];
+            if let Some(path) = newest_existing_path(&candidates) {
+                return Ok(path);
             }
 
             Err(format!(
@@ -198,6 +224,48 @@ fn resolve_agent_dll_path(target_machine: IMAGE_FILE_MACHINE) -> Result<PathBuf,
                 ))
             }
         }
+    }
+}
+
+fn newest_existing_path(candidates: &[PathBuf]) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut first_existing: Option<PathBuf> = None;
+
+    for candidate in candidates {
+        if !candidate.exists() {
+            continue;
+        }
+        if first_existing.is_none() {
+            first_existing = Some(candidate.clone());
+        }
+
+        let modified = fs::metadata(candidate)
+            .and_then(|meta| meta.modified())
+            .ok();
+        if let Some(modified) = modified {
+            match &best {
+                Some((best_time, _)) if modified <= *best_time => {}
+                _ => best = Some((modified, candidate.clone())),
+            }
+        }
+    }
+
+    best.map(|(_, path)| path).or(first_existing)
+}
+
+fn describe_file_brief(path: &Path) -> String {
+    match fs::metadata(path) {
+        Ok(meta) => {
+            let size = meta.len();
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs().to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            format!("size={size} mtime_unix={mtime}")
+        }
+        Err(_) => "metadata_unavailable".to_owned(),
     }
 }
 
@@ -292,10 +360,70 @@ fn find_i686_libunwind_from_where() -> Option<PathBuf> {
     None
 }
 
-fn resolve_remote_loadlibraryw(pid: u32, target_machine: IMAGE_FILE_MACHINE) -> Result<usize, String> {
-    let kernel32 = find_remote_module(pid, "kernel32.dll", target_machine)?;
+fn resolve_remote_loadlibraryw(
+    process: HANDLE,
+    pid: u32,
+    target_machine: IMAGE_FILE_MACHINE,
+) -> Result<usize, String> {
+    let kernel32 = find_remote_module(process, pid, "kernel32.dll", target_machine)?;
     let load_library_rva = find_export_rva(&kernel32.path, "LoadLibraryW")? as usize;
     Ok(kernel32.base_addr + load_library_rva)
+}
+
+fn run_remote_export(
+    process: HANDLE,
+    remote_module_base: usize,
+    local_module_path: &Path,
+    export_name: &str,
+) -> Result<(), String> {
+    let export_rva = find_export_rva(local_module_path, export_name)? as usize;
+    let remote_export_addr = remote_module_base + export_rva;
+    let thread_start: LPTHREAD_START_ROUTINE =
+        Some(unsafe { std::mem::transmute(remote_export_addr) });
+
+    let remote_thread = unsafe {
+        CreateRemoteThread(
+            process,
+            std::ptr::null(),
+            0,
+            thread_start,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if remote_thread.is_null() {
+        return Err(format!(
+            "CreateRemoteThread failed for {} (GetLastError={})",
+            export_name,
+            last_error_code()
+        ));
+    }
+    let thread_handle = HandleGuard(remote_thread);
+
+    let wait_result = unsafe { WaitForSingleObject(thread_handle.0, INFINITE) };
+    if wait_result != WAIT_OBJECT_0 {
+        return Err(format!(
+            "WaitForSingleObject failed for {} with code {}",
+            export_name, wait_result
+        ));
+    }
+
+    let mut remote_return_code = 0u32;
+    let exit_ok =
+        unsafe { GetExitCodeThread(thread_handle.0, &mut remote_return_code as *mut u32) } != 0;
+    if !exit_ok {
+        return Err(format!("GetExitCodeThread failed for {}", export_name));
+    }
+
+    if remote_return_code == 0 {
+        return Err(format!(
+            "Remote {} returned 0 in PID initialization path.",
+            export_name
+        ));
+    }
+
+    Ok(())
 }
 
 struct RemoteModule {
@@ -304,6 +432,7 @@ struct RemoteModule {
 }
 
 fn find_remote_module(
+    process: HANDLE,
     pid: u32,
     wanted_module_name: &str,
     target_machine: IMAGE_FILE_MACHINE,
@@ -315,8 +444,10 @@ fn find_remote_module(
     };
 
     let mut last_error = 0u32;
+    const TRANSIENT_RETRY_ATTEMPTS: usize = 200;
+    const TRANSIENT_RETRY_SLEEP_MS: u64 = 2;
 
-    for _attempt in 0..10 {
+    for _attempt in 0..TRANSIENT_RETRY_ATTEMPTS {
         for &flags in flags_to_try {
             let snapshot = unsafe { CreateToolhelp32Snapshot(flags, pid) };
             if snapshot == INVALID_HANDLE_VALUE {
@@ -330,10 +461,17 @@ fn find_remote_module(
             entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
 
             let first_ok =
-                unsafe { Module32FirstW(snapshot_handle.0, &mut entry as *mut MODULEENTRY32W) } != 0;
+                unsafe { Module32FirstW(snapshot_handle.0, &mut entry as *mut MODULEENTRY32W) }
+                    != 0;
             if !first_ok {
                 let error = last_error_code();
                 last_error = error;
+                if error == ERROR_PARTIAL_COPY
+                    || error == ERROR_BAD_LENGTH
+                    || error == ERROR_NO_MORE_FILES
+                {
+                    continue;
+                }
                 continue;
             }
 
@@ -348,7 +486,8 @@ fn find_remote_module(
                 }
 
                 let next_ok =
-                    unsafe { Module32NextW(snapshot_handle.0, &mut entry as *mut MODULEENTRY32W) } != 0;
+                    unsafe { Module32NextW(snapshot_handle.0, &mut entry as *mut MODULEENTRY32W) }
+                        != 0;
                 if !next_ok {
                     break;
                 }
@@ -356,8 +495,11 @@ fn find_remote_module(
         }
 
         // Target process may still be initializing loader metadata.
-        if last_error == ERROR_PARTIAL_COPY || last_error == ERROR_BAD_LENGTH {
-            thread::sleep(Duration::from_millis(60));
+        if last_error == ERROR_PARTIAL_COPY
+            || last_error == ERROR_BAD_LENGTH
+            || last_error == ERROR_NO_MORE_FILES
+        {
+            thread::sleep(Duration::from_millis(TRANSIENT_RETRY_SLEEP_MS));
             continue;
         }
 
@@ -365,15 +507,116 @@ fn find_remote_module(
     }
 
     if last_error == ERROR_PARTIAL_COPY {
+        if let Ok(module) =
+            find_remote_module_via_psapi(process, wanted_module_name, target_machine)
+        {
+            return Ok(module);
+        }
         return Err(format!(
             "CreateToolhelp32Snapshot(module) failed for PID {pid} (GetLastError={last_error}). The target may be protected or not fully initialized yet. Try again after the process is fully up, or run tracer/target with matching privileges."
         ));
+    }
+
+    if let Ok(module) = find_remote_module_via_psapi(process, wanted_module_name, target_machine) {
+        return Ok(module);
     }
 
     Err(format!(
         "Failed to locate module {} in PID {} (last error={}).",
         wanted_module_name, pid, last_error
     ))
+}
+
+fn find_remote_module_via_psapi(
+    process: HANDLE,
+    wanted_module_name: &str,
+    target_machine: IMAGE_FILE_MACHINE,
+) -> Result<RemoteModule, String> {
+    let filter_flag = if target_machine == IMAGE_FILE_MACHINE_I386 {
+        LIST_MODULES_32BIT
+    } else {
+        LIST_MODULES_ALL
+    };
+
+    let mut module_capacity = 256usize;
+    loop {
+        let mut modules: Vec<HMODULE> = vec![std::ptr::null_mut(); module_capacity];
+        let mut bytes_needed = 0u32;
+
+        let enum_ok = unsafe {
+            K32EnumProcessModulesEx(
+                process,
+                modules.as_mut_ptr(),
+                (modules.len() * std::mem::size_of::<HMODULE>()) as u32,
+                &mut bytes_needed as *mut u32,
+                filter_flag,
+            )
+        } != 0;
+
+        if !enum_ok {
+            return Err(format!(
+                "K32EnumProcessModulesEx failed (GetLastError={})",
+                last_error_code()
+            ));
+        }
+
+        let needed_count = (bytes_needed as usize) / std::mem::size_of::<HMODULE>();
+        if needed_count > modules.len() {
+            module_capacity = needed_count + 16;
+            continue;
+        }
+
+        modules.truncate(needed_count);
+        for module in modules {
+            if module.is_null() {
+                continue;
+            }
+
+            let mut base_name_buf = [0u16; 260];
+            let base_name_len = unsafe {
+                K32GetModuleBaseNameW(
+                    process,
+                    module,
+                    base_name_buf.as_mut_ptr(),
+                    base_name_buf.len() as u32,
+                )
+            };
+            if base_name_len == 0 {
+                continue;
+            }
+
+            let base_name = String::from_utf16_lossy(&base_name_buf[..base_name_len as usize]);
+            if !base_name.eq_ignore_ascii_case(wanted_module_name) {
+                continue;
+            }
+
+            let mut path_buf = vec![0u16; 1024];
+            let path_len = unsafe {
+                K32GetModuleFileNameExW(
+                    process,
+                    module,
+                    path_buf.as_mut_ptr(),
+                    path_buf.len() as u32,
+                )
+            };
+
+            let path = if path_len == 0 {
+                PathBuf::from(base_name)
+            } else {
+                PathBuf::from(String::from_utf16_lossy(&path_buf[..path_len as usize]))
+            };
+
+            return Ok(RemoteModule {
+                base_addr: module as usize,
+                path,
+            });
+        }
+
+        return Err(format!(
+            "Module {} not found via K32EnumProcessModulesEx",
+            wanted_module_name
+        ));
+    }
 }
 
 fn detect_process_machine(process: HANDLE) -> Result<IMAGE_FILE_MACHINE, String> {
@@ -441,7 +684,10 @@ fn find_export_rva(module_path: &Path, export_name: &str) -> Result<u32, String>
 
     let nt_off = read_u32(&data, 0x3C)? as usize;
     if read_u32(&data, nt_off)? != 0x0000_4550 {
-        return Err(format!("{} has invalid PE signature", module_path.display()));
+        return Err(format!(
+            "{} has invalid PE signature",
+            module_path.display()
+        ));
     }
 
     let coff_off = nt_off + 4;
